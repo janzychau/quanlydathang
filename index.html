@@ -3509,6 +3509,7 @@
                     }
 
                     closeModalImportExcel();
+                    if(count>0) window.__qldhMarkDirty?.('sanPham');
                     renderSanPhamView();
                     showCustomConfirm(`Import thành công ${count} sản phẩm mới từ file Excel!`, 'Thành Công');
                 } catch (err) {
@@ -4207,6 +4208,7 @@
         if (!p) return;
         showCustomConfirm(`Bạn có chắc chắn muốn xóa phiếu "${p.ma}" không?`, 'Xác Nhận Xóa', function() {
             listPhieuDeXuat = listPhieuDeXuat.filter(x => x.id !== id);
+            window.__qldhMarkDirty?.('phieuDeXuat');
             renderDeXuatView();
         });
     };
@@ -5258,6 +5260,7 @@
             }
             const item = { id: ma, ma, ten, ghiChu };
             tab.items.push(item);
+            window.__qldhMarkDirty?.('danhMucTabs');
             rebuild(select, tabName, ten);
             select.dataset.cleanPrevious = ten;
             if (typeof onSaved === 'function') onSaved(ten, item);
@@ -5472,6 +5475,7 @@
         }
         const item = { id: ma, ma, ten: clean, ghiChu: String(ghiChu || '').trim() };
         t.items.push(item);
+        window.__qldhMarkDirty?.('danhMucTabs');
         return item;
     }
 
@@ -5995,6 +5999,7 @@
       const names=selected.map(t=>t.name).join(', ');
       const doDelete=function(){
         if(typeof danhMucTabs !== 'undefined') danhMucTabs=danhMucTabs.filter(t=>!ids.includes(String(t.id)));
+        window.__qldhMarkDirty?.('danhMucTabs');
         if(typeof danhMucTabs !== 'undefined'){
           if(!danhMucTabs.length) currentDanhMucTabId='';
           else if(!danhMucTabs.some(t=>String(t.id)===String(currentDanhMucTabId))) currentDanhMucTabId=danhMucTabs[0].id;
@@ -6369,6 +6374,7 @@
       const idx=catalog.findIndex(x=>x.id===id);
       if(idx>=0) catalog.splice(idx,1);
       try { if(Array.isArray(listSanPham) && listSanPham!==catalog){ listSanPham.length=0; catalog.forEach(x=>listSanPham.push(x)); } } catch(e){}
+      window.__qldhMarkDirty?.('sanPham');
       window.renderSanPhamView?.();
     });
   };
@@ -6610,6 +6616,7 @@
   const POLL_MS=5000, SAVE_CHECK_MS=5000;
   const SAVE_DEBOUNCE_MS=250;
   const dirtyKeys=new Set();
+  const pendingMutationKeys=new Set();
   const saveInFlight=new Map();
   let saveFlushTimer=null;
   const WARMUP_MS=5*60*1000;
@@ -6812,13 +6819,10 @@
       const r=await api('/api/state'),remote=r.state||{}; let changed=false;
       for(const k of Object.keys(getters)){
         if(!Array.isArray(remote[k]))continue;
-        // Không lấy snapshot cũ từ server trong lúc key này đang chờ lưu.
-        if(dirtyKeys.has(k)||saveInFlight.has(k))continue;
+        // Không lấy snapshot cũ từ server khi key đang có thao tác local
+        // (đặc biệt là hộp xác nhận Xóa chưa chạy callback).
+        if(dirtyKeys.has(k)||saveInFlight.has(k)||pendingMutationKeys.has(k))continue;
         const rh=h(remote[k]), lh=h(getters[k]());
-        // Chỉ bỏ qua khi key này thực sự đang có thao tác local chưa lưu.
-        // Không dùng chênh lệch hash local để chặn pull, vì các hàm render/chuẩn hoá
-        // có thể tự bổ sung field vào object và làm hash đổi dù người dùng không sửa dữ liệu.
-        if(dirtyKeys.has(k)||saveInFlight.has(k))continue;
         if(lh!==rh){setKey(k,remote[k]);lastHash[k]=rh;cacheStateKey(k,remote[k]);changed=true;}
       }
       if(changed){syncRefs();try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}}
@@ -6941,16 +6945,66 @@
     showCustomConfirm(`Bạn có chắc muốn xóa nhân viên "${n?.ten||''}"?`,'Xác Nhận Xóa',async()=>{try{await api('/api/employees/'+encodeURIComponent(id),{method:'DELETE'});await loadEmployees();renderNhanVienView();}catch(err){fail(err.data?.error||'Không thể xóa nhân viên.');}});
   };
 
+  // Cho các patch khác gọi được đánh dấu thay đổi sau khi họ thực sự mutate dữ liệu.
+  window.__qldhMarkDirty=function(k){markDirty(k);};
+
   function wrapSaveSync(name, keysFn){
     const orig=window[name];
     if(typeof orig!=='function' || orig.__qldhFastSync)return;
     const wrapped=function(...args){
       let keys=[];
       try{keys=keysFn(...args)||[];}catch(e){keys=[];}
+      const before={};
+      keys.forEach(k=>{try{before[k]=h(getters[k]());}catch(e){before[k]='';}});
       const result=orig.apply(this,args);
-      // Không JSON.stringify toàn bộ danh sách trước/sau khi bấm Lưu.
-      // Chỉ đánh dấu key cần đồng bộ; dữ liệu được gửi ở nền.
-      keys.forEach(k=>markDirty(k));
+
+      // Chỉ đồng bộ khi hàm lưu thực sự thay đổi state. Điều này tránh việc
+      // bấm Lưu nhưng validation thất bại lại gửi snapshot cũ lên server.
+      let changed=false;
+      for(const k of keys){
+        try{if(h(getters[k]())!==before[k]){changed=true;break;}}catch(e){}
+      }
+      if(changed) keys.forEach(k=>markDirty(k));
+      return result;
+    };
+    wrapped.__qldhFastSync=true;
+    window[name]=wrapped;
+  }
+
+  // Hàm xóa dùng hộp xác nhận: khóa pull trong lúc chờ callback xác nhận.
+  // Như vậy snapshot cũ từ server không thể ghi đè/xâm nhập trước khi thao tác xóa
+  // hoàn tất, tránh tình trạng phiếu vừa xóa lại bị ghi ngược trở lại.
+  function wrapDeleteSync(name, keysFn){
+    const orig=window[name];
+    if(typeof orig!=='function' || orig.__qldhFastSync)return;
+    const wrapped=function(...args){
+      let keys=[];
+      try{keys=keysFn(...args)||[];}catch(e){keys=[];}
+      keys.forEach(k=>pendingMutationKeys.add(k));
+      const before={};
+      keys.forEach(k=>{try{before[k]=h(getters[k]());}catch(e){before[k]='';}});
+
+      const release=()=>keys.forEach(k=>pendingMutationKeys.delete(k));
+      const result=orig.apply(this,args);
+
+      let tries=0;
+      const check=()=>{
+        let changed=false;
+        for(const k of keys){
+          try{
+            if(h(getters[k]())!==before[k]){changed=true;break;}
+          }catch(e){}
+        }
+        if(changed){
+          keys.forEach(k=>markDirty(k));
+          release();
+          return;
+        }
+        if(++tries<40){setTimeout(check,250);return;}
+        // Người dùng có thể đã bấm Hủy. Không giữ khóa vô thời hạn.
+        release();
+      };
+      setTimeout(check,50);
       return result;
     };
     wrapped.__qldhFastSync=true;
@@ -6969,10 +7023,10 @@
   wrapSaveSync('handleSaveSanPham',()=>['sanPham']);
   wrapSaveSync('handleSaveTab',()=>['danhMucTabs']);
   wrapSaveSync('handleSaveItem',()=>['danhMucTabs']);
-  wrapSaveSync('handleDeleteDeXuat',()=>['phieuDeXuat']);
-  wrapSaveSync('handleDeleteSanPham',()=>['sanPham']);
-  wrapSaveSync('handleDeleteTab',()=>['danhMucTabs']);
-  wrapSaveSync('handleDeleteItem',()=>['danhMucTabs']);
+  wrapDeleteSync('handleDeleteDeXuat',()=>['phieuDeXuat']);
+  wrapDeleteSync('handleDeleteSanPham',()=>['sanPham']);
+  wrapDeleteSync('handleDeleteTab',()=>['danhMucTabs']);
+  wrapDeleteSync('handleDeleteItem',()=>['danhMucTabs']);
 
   document.addEventListener('DOMContentLoaded',()=>{
     warmupAPI();
