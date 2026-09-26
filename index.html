@@ -6583,7 +6583,7 @@
   }
 })();
 </script>
-<!-- MULTI-USER BRIDGE v2 -->
+<!-- MULTI-USER BRIDGE v3 - FAST LOGIN -->
 <script>
 (function(){
   'use strict';
@@ -6646,7 +6646,21 @@
   }
   function mapNV(n){return {id:n.id,ma:n.ma,ten:n.ten,chucVu:n.chuc_vu||'',phongBan:n.phong_ban||'',taiKhoan:n.tai_khoan,matKhau:'',phanQuyen:n.phan_quyen||VIEWER,hieuLuc:n.hieu_luc!==false,ghiChu:n.ghi_chu||''};}
   async function loadEmployees(){
-    const r=await api('/api/employees'); listNhanVien=(r.data||[]).map(mapNV); window.listNhanVien=listNhanVien;
+    const r=await api('/api/employees');
+    listNhanVien=(r.data||[]).map(mapNV);
+    window.listNhanVien=listNhanVien;
+  }
+
+  function setSyncStatus(message, visible=true){
+    let el=document.getElementById('qldhSyncStatus');
+    if(!el){
+      el=document.createElement('div');
+      el.id='qldhSyncStatus';
+      el.style.cssText='position:fixed;right:18px;bottom:18px;z-index:99999;background:rgba(15,23,42,.92);color:#fff;padding:10px 14px;border-radius:12px;font:600 12px/1.3 Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.18);transition:opacity .2s;';
+      document.body.appendChild(el);
+    }
+    el.textContent=message||'';
+    el.style.display=visible?'block':'none';
   }
   async function saveKey(k,v){
     if(!getToken()||!canWrite(k))return;
@@ -6656,11 +6670,27 @@
   }
   async function loadState(){
     const r=await api('/api/state'), remote=r.state||{};
+    const missing=[];
     for(const k of Object.keys(getters)){
-      if(Array.isArray(remote[k])){setKey(k,remote[k]);lastHash[k]=h(remote[k]);}
-      else if(role()===OWNER){await saveKey(k,getters[k]());}
-      else {setKey(k,[]);lastHash[k]=h([]);}
+      if(Array.isArray(remote[k])){
+        setKey(k,remote[k]);
+        lastHash[k]=h(remote[k]);
+      } else if(role()===OWNER){
+        missing.push(k);
+      } else {
+        setKey(k,[]);
+        lastHash[k]=h([]);
+      }
     }
+
+    // Nếu database mới tạo và chưa có các key, tạo song song thay vì 8 request nối tiếp.
+    if(missing.length){
+      await Promise.all(missing.map(async k=>{
+        try{await saveKey(k,getters[k]());}
+        catch(e){console.error('INIT STATE',k,e);}
+      }));
+    }
+
     syncRefs();
     try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}
   }
@@ -6685,19 +6715,49 @@
   async function finishLogin(u){
     currentUser=window.currentUser={id:u.id,username:u.tai_khoan,tenNV:u.ten,phanQuyen:u.phan_quyen,ma:u.ma,chucVu:u.chuc_vu||'',phongBan:u.phong_ban||''};
     const l=document.getElementById('lblUserDisplay');if(l)l.innerText=`${u.ten} (${u.phan_quyen})`;
-    document.getElementById('loginView')?.classList.add('hidden');document.getElementById('appView')?.classList.remove('hidden');
-    await loadEmployees();await loadState();startLoops();
+
+    // Cho người dùng vào giao diện ngay sau khi xác thực. Dữ liệu Supabase tải nền.
+    document.getElementById('loginView')?.classList.add('hidden');
+    document.getElementById('appView')?.classList.remove('hidden');
     try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(e){}
     try{switchView('deXuat');}catch(e){}
+    setSyncStatus('Đang đồng bộ dữ liệu...',true);
+
+    // Tải nhân viên + toàn bộ state song song, tránh chờ nối tiếp 2-10 request.
+    const results=await Promise.allSettled([loadEmployees(),loadState()]);
+    const failed=results.filter(r=>r.status==='rejected');
+    if(failed.length){
+      console.error('SYNC AFTER LOGIN',failed);
+      setSyncStatus('Đã vào hệ thống • Đồng bộ đang thử lại...',true);
+      setTimeout(()=>setSyncStatus('',false),5000);
+    } else {
+      setSyncStatus('Đã đồng bộ dữ liệu ✓',true);
+      setTimeout(()=>setSyncStatus('',false),1800);
+    }
+    startLoops();
+    try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(e){}
+    try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}
   }
 
   window.handleLogin=async function(e){
     e?.preventDefault?.();
     const username=(document.getElementById('username')?.value||'').trim();
     const password=document.getElementById('password')?.value||'';
+    const btn=document.querySelector('#loginView button[type="submit"]');
     if(!username||!password)return fail('Vui lòng nhập Tài khoản và Mật khẩu.');
-    try{const r=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username,password})});setToken(r.token);await finishLogin(r.user);}
-    catch(err){console.error('LOGIN',err);fail(err.data?.error||'Không thể đăng nhập vào máy chủ.');}
+    const oldText=btn?.innerText;
+    if(btn){btn.disabled=true;btn.innerText='Đang xác thực...';}
+    try{
+      // Chỉ chờ API đăng nhập. Không chặn màn hình bởi bước tải dữ liệu phía sau.
+      const r=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username,password})});
+      setToken(r.token);
+      await finishLogin(r.user);
+    } catch(err){
+      console.error('LOGIN',err);
+      fail(err.data?.error||'Không thể đăng nhập vào máy chủ.');
+    } finally {
+      if(btn){btn.disabled=false;btn.innerText=oldText||'Đăng Nhập';}
+    }
   };
   window.handleLogout=function(){
     const really=()=>{stopLoops();setToken('');currentUser=window.currentUser=null;document.getElementById('username').value='';document.getElementById('password').value='';document.getElementById('appView').classList.add('hidden');document.getElementById('loginView').classList.remove('hidden');};
