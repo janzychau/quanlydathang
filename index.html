@@ -4336,7 +4336,8 @@
         }
 
         const trh = table.querySelector('thead tr');
-        if (trh) {
+        const headerHasTeam = !!(trh && Array.from(trh.children).some(th => String(th.textContent||'').trim().toLowerCase()==='team đề xuất'));
+        if (!headerHasTeam && trh) {
             const th = document.createElement('th');
             th.className = 'p-2.5 border-r min-w-[110px]';
             th.textContent = 'Team Đề Xuất';
@@ -4344,14 +4345,16 @@
             trh.insertBefore(th, last);
         }
 
-        table.querySelectorAll('tbody tr').forEach(tr => {
-            if (!tr.children.length || tr.children.length === 1) return;
-            const obj = finder(tr);
-            const td = document.createElement('td');
-            td.className = 'p-2.5 border-r font-semibold text-slate-700';
-            td.textContent = obj?.teamDeXuat || '-';
-            tr.insertBefore(td, tr.lastElementChild);
-        });
+        if (!headerHasTeam) {
+            table.querySelectorAll('tbody tr').forEach(tr => {
+                if (!tr.children.length || tr.children.length === 1) return;
+                const obj = finder(tr);
+                const td = document.createElement('td');
+                td.className = 'p-2.5 border-r font-semibold text-slate-700';
+                td.textContent = obj?.teamDeXuat || '-';
+                tr.insertBefore(td, tr.lastElementChild);
+            });
+        }
         table.dataset.teamReady = '1';
     }
 
@@ -6594,13 +6597,15 @@
   }
 })();
 </script>
-<!-- MULTI-USER BRIDGE v5 - FAST LOGIN + FAST SAVE -->
+<!-- MULTI-USER BRIDGE v6 - LOCAL-FIRST + FAST LOGIN + FAST SAVE -->
 <script>
 (function(){
   'use strict';
   const API_BASE='https://quanlydathang-api.onrender.com';
-  const TOKEN_KEY='qldh_api_token_v1';
-  const POLL_MS=30000, SAVE_CHECK_MS=15000;
+  const TOKEN_KEY='qldh_api_token_v2';
+  const OLD_TOKEN_KEY='qldh_api_token_v1';
+  const USER_CACHE_KEY='qldh_cached_user_v1';
+  const POLL_MS=5000, SAVE_CHECK_MS=5000;
   const SAVE_DEBOUNCE_MS=250;
   const dirtyKeys=new Set();
   const saveInFlight=new Map();
@@ -6630,8 +6635,23 @@
   let lastHash={};
   let pulling=false;
 
-  function getToken(){return sessionStorage.getItem(TOKEN_KEY)||'';}
-  function setToken(v){if(v)sessionStorage.setItem(TOKEN_KEY,v);else sessionStorage.removeItem(TOKEN_KEY);}
+  function getToken(){
+    return localStorage.getItem(TOKEN_KEY)||sessionStorage.getItem(TOKEN_KEY)||localStorage.getItem(OLD_TOKEN_KEY)||sessionStorage.getItem(OLD_TOKEN_KEY)||'';
+  }
+  function setToken(v){
+    if(v){
+      localStorage.setItem(TOKEN_KEY,v);
+      sessionStorage.setItem(TOKEN_KEY,v);
+    }else{
+      localStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(OLD_TOKEN_KEY);
+      sessionStorage.removeItem(OLD_TOKEN_KEY);
+      localStorage.removeItem(USER_CACHE_KEY);
+    }
+  }
+  function cacheUser(u){try{localStorage.setItem(USER_CACHE_KEY,JSON.stringify(u||null));}catch(e){}}
+  function getCachedUser(){try{return JSON.parse(localStorage.getItem(USER_CACHE_KEY)||'null');}catch(e){return null;}}
   function role(){return String(window.currentUser?.phanQuyen||'').trim();}
   function h(v){try{return JSON.stringify(v??null);}catch(e){return '';}}
   function canWrite(k){return (WRITE_KEYS[k]||[]).includes(role());}
@@ -6707,8 +6727,9 @@
     saveInFlight.set(k,{hash:x});
     try{
       await api('/api/state/'+encodeURIComponent(k),{method:'PUT',body:JSON.stringify(a)});
-      // Chỉ xác nhận snapshot sau khi server đã trả thành công.
       lastHash[k]=x;
+      setSyncStatus('Đã lưu ✓',true);
+      setTimeout(()=>{if(!dirtyKeys.size && !saveInFlight.size)setSyncStatus('',false);},700);
     }catch(e){
       dirtyKeys.add(k);
       if(e.status===401){setToken('');}else console.error('SAVE',k,e);
@@ -6735,9 +6756,16 @@
   }
 
   async function loadState(){
+    const beforeHash={};
+    for(const k of Object.keys(getters))beforeHash[k]=h(getters[k]());
     const r=await api('/api/state'), remote=r.state||{};
     const missing=[];
     for(const k of Object.keys(getters)){
+      const changedWhileLoading=h(getters[k]())!==beforeHash[k];
+      if(changedWhileLoading || dirtyKeys.has(k) || saveInFlight.has(k)) {
+        // Người dùng đã thao tác trong lúc đồng bộ ban đầu: tuyệt đối không ghi đè local.
+        continue;
+      }
       if(Array.isArray(remote[k])){
         setKey(k,remote[k]);
         lastHash[k]=h(remote[k]);
@@ -6780,32 +6808,32 @@
   function startLoops(){if(saveTimer||pollTimer)return;saveTimer=setInterval(checkSave,SAVE_CHECK_MS);pollTimer=setInterval(pull,POLL_MS);}
   function stopLoops(){if(saveTimer)clearInterval(saveTimer);if(pollTimer)clearInterval(pollTimer);saveTimer=pollTimer=null;}
 
-  async function finishLogin(u){
-    currentUser=window.currentUser={id:u.id,username:u.tai_khoan,tenNV:u.ten,phanQuyen:u.phan_quyen,ma:u.ma,chucVu:u.chuc_vu||'',phongBan:u.phong_ban||''};
-    const l=document.getElementById('lblUserDisplay');if(l)l.innerText=`${u.ten} (${u.phan_quyen})`;
-
-    // Cho người dùng vào giao diện ngay sau khi xác thực. Dữ liệu Supabase tải nền.
+  function showAppForUser(u){
+    currentUser=window.currentUser={id:u.id,username:u.tai_khoan,tenNV:u.ten||u.tenNV||u.username||u.tai_khoan,phanQuyen:u.phan_quyen||u.phanQuyen||VIEWER,ma:u.ma||'',chucVu:u.chuc_vu||u.chucVu||'',phongBan:u.phong_ban||u.phongBan||''};
+    const l=document.getElementById('lblUserDisplay');if(l)l.innerText=`${currentUser.tenNV} (${currentUser.phanQuyen})`;
     document.getElementById('loginView')?.classList.add('hidden');
     document.getElementById('appView')?.classList.remove('hidden');
     try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(e){}
-    try{switchView('deXuat');}catch(e){}
-    setSyncStatus('Đang đồng bộ dữ liệu...',true);
+    try{if(typeof switchView==='function')switchView('deXuat');}catch(e){}
+  }
 
-    // Tải dữ liệu nền, tuyệt đối không chặn thao tác của người dùng sau khi login.
+  async function finishLogin(u){
+    showAppForUser(u);
+    cacheUser(u);
+    setSyncStatus('Đang đồng bộ dữ liệu...',true);
     startLoops();
+    // Đồng bộ nền, không chặn giao diện.
     Promise.allSettled([loadEmployees(),loadState()]).then(results=>{
-      const failed=results.filter(r=>r.status==='rejected');
-      if(failed.length){
-        console.error('SYNC AFTER LOGIN',failed);
-        setSyncStatus('Đã vào hệ thống • Đồng bộ đang thử lại...',true);
-        setTimeout(()=>setSyncStatus('',false),5000);
-      } else {
-        setSyncStatus('Đã đồng bộ dữ liệu ✓',true);
-        setTimeout(()=>setSyncStatus('',false),1800);
+      const failed=results.some(x=>x.status==='rejected');
+      if(failed){
+        console.error('SYNC AFTER LOGIN',results);
+        setSyncStatus('Đã vào hệ thống • Đồng bộ sẽ thử lại',true);
+        setTimeout(()=>setSyncStatus('',false),4000);
+      }else{
+        setSyncStatus('Đã đồng bộ ✓',true);
+        setTimeout(()=>setSyncStatus('',false),1200);
       }
     });
-    try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(e){}
-    try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}
   }
 
   window.handleLogin=async function(e){
@@ -6815,70 +6843,48 @@
     const btn=document.querySelector('#loginView button[type="submit"]');
     if(!username||!password)return fail('Vui lòng nhập Tài khoản và Mật khẩu.');
     const oldText=btn?.innerText;
-    if(btn){btn.disabled=true;btn.innerText='Đang xác thực máy chủ...';}
+    if(btn){btn.disabled=true;btn.innerText='Đang xác thực...';}
 
-    let r;
     try{
+      // application/x-www-form-urlencoded là CORS-simple, tránh preflight.
+      const body=new URLSearchParams({username,password}).toString();
       const res=await fetch(API_BASE+'/api/auth/login',{
         method:'POST',
-        headers:{'Content-Type':'text/plain;charset=UTF-8'},
-        body:JSON.stringify({username,password}),
-        cache:'no-store'
+        headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+        body,cache:'no-store'
       });
       const txt=await res.text();
-      try{r=txt?JSON.parse(txt):{};}catch(_){r={};}
+      let r={};try{r=txt?JSON.parse(txt):{};}catch(_){}
       if(!res.ok){
-        const er=new Error(r.error||('HTTP '+res.status));
-        er.status=res.status;er.data=r;throw er;
+        const er=new Error(r.error||('HTTP '+res.status));er.status=res.status;er.data=r;throw er;
       }
-    }catch(err){
-      console.error('LOGIN API',err);
-      fail(err.data?.error||'Không thể đăng nhập vào máy chủ.');
+      if(!r?.token||!r?.user)throw new Error('Máy chủ không trả về thông tin đăng nhập hợp lệ.');
+
+      setToken(r.token);
+      cacheUser(r.user);
+      showAppForUser(r.user);
+      setSyncStatus('Đang đồng bộ dữ liệu...',true);
       if(btn){btn.disabled=false;btn.innerText=oldText||'Đăng Nhập';}
-      return;
-    }
-
-    if(!r?.token||!r?.user){
-      fail('Máy chủ không trả về thông tin đăng nhập hợp lệ.');
-      if(btn){btn.disabled=false;btn.innerText=oldText||'Đăng Nhập';}
-      return;
-    }
-
-    // Xác thực thành công: chỉ cập nhật trạng thái tối thiểu trước,
-    // để trình duyệt có thể vẽ giao diện ngay lập tức.
-    setToken(r.token);
-    const u=r.user;
-    currentUser=window.currentUser={
-      id:u.id,username:u.tai_khoan,tenNV:u.ten,phanQuyen:u.phan_quyen,
-      ma:u.ma,chucVu:u.chuc_vu||'',phongBan:u.phong_ban||''
-    };
-    const label=document.getElementById('lblUserDisplay');
-    if(label)label.innerText=`${u.ten} (${u.phan_quyen})`;
-    document.getElementById('loginView')?.classList.add('hidden');
-    document.getElementById('appView')?.classList.remove('hidden');
-    setSyncStatus('Đang đồng bộ dữ liệu...',true);
-    if(btn){btn.disabled=false;btn.innerText=oldText||'Đăng Nhập';}
-
-    // Các thao tác render / đồng bộ chạy sau frame hiện tại, không chặn nút Đăng Nhập.
-    setTimeout(()=>{
-      try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(err){console.error('LOGIN UI',err);}
-      try{if(typeof switchView==='function')switchView('deXuat');}catch(err){console.error('LOGIN VIEW',err);}
-    },0);
-
-    setTimeout(()=>{
+      startLoops();
+      // Đồng bộ nền, tuyệt đối không chặn giao diện.
       Promise.allSettled([loadEmployees(),loadState()]).then(results=>{
         const failed=results.some(x=>x.status==='rejected');
         if(failed){
           console.error('SYNC AFTER LOGIN',results);
-          setSyncStatus('Đã vào hệ thống • Đồng bộ đang thử lại...',true);
-          setTimeout(()=>setSyncStatus('',false),5000);
+          setSyncStatus('Đã vào hệ thống • Đồng bộ sẽ thử lại',true);
+          setTimeout(()=>setSyncStatus('',false),4000);
         }else{
-          setSyncStatus('Đã đồng bộ dữ liệu ✓',true);
-          setTimeout(()=>setSyncStatus('',false),1800);
+          setSyncStatus('Đã đồng bộ ✓',true);
+          setTimeout(()=>setSyncStatus('',false),1200);
         }
       });
-    },20);
+    }catch(err){
+      console.error('LOGIN API',err);
+      fail(err.data?.error||err.message||'Không thể đăng nhập vào máy chủ.');
+      if(btn){btn.disabled=false;btn.innerText=oldText||'Đăng Nhập';}
+    }
   };
+
   window.handleLogout=function(){
     const really=()=>{stopLoops();setToken('');currentUser=window.currentUser=null;document.getElementById('username').value='';document.getElementById('password').value='';document.getElementById('appView').classList.add('hidden');document.getElementById('loginView').classList.remove('hidden');};
     showCustomConfirm('Bạn có chắc chắn muốn đăng xuất khỏi hệ thống?','Đăng Xuất',really);
@@ -6947,16 +6953,35 @@
 
   document.addEventListener('DOMContentLoaded',()=>{
     warmupAPI();
-    window.addEventListener('focus',()=>{
+    const warm=()=>{
       if(document.getElementById('loginView') && !document.getElementById('loginView').classList.contains('hidden')) warmupAPI();
-    });
-    warmupTimer=setInterval(()=>{
-      if(document.getElementById('loginView') && !document.getElementById('loginView').classList.contains('hidden')) warmupAPI();
-    },WARMUP_MS);
-    setTimeout(async()=>{
-      const t=getToken();if(!t)return;
-      try{const r=await api('/api/auth/me');await finishLogin(r.user);}catch(e){setToken('');}
-    },150);
+    };
+    document.getElementById('username')?.addEventListener('focus',warm);
+    document.getElementById('password')?.addEventListener('focus',warm);
+    window.addEventListener('focus',warm);
+    warmupTimer=setInterval(warm,WARMUP_MS);
+
+    // Có token + user cache thì vào app ngay; xác minh server chạy nền.
+    setTimeout(()=>{
+      const t=getToken(),cached=getCachedUser();
+      if(!t||!cached)return;
+      showAppForUser(cached);
+      setSyncStatus('Kiểm tra phiên đăng nhập...',true);
+      startLoops();
+      api('/api/auth/me').then(r=>{
+        cacheUser(r.user);showAppForUser(r.user);
+        setSyncStatus('Đã đồng bộ ✓',true);
+        setTimeout(()=>setSyncStatus('',false),1200);
+        Promise.allSettled([loadEmployees(),loadState()]);
+      }).catch(e=>{
+        console.warn('SESSION VERIFY FAILED',e);
+        setToken('');
+        currentUser=window.currentUser=null;
+        document.getElementById('appView')?.classList.add('hidden');
+        document.getElementById('loginView')?.classList.remove('hidden');
+        setSyncStatus('',false);
+      });
+    },120);
   });
 })();
 
