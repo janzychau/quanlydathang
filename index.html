@@ -6603,7 +6603,7 @@
   }
 })();
 </script>
-<!-- MULTI-USER BRIDGE v6 - LOCAL-FIRST + FAST LOGIN + FAST SAVE -->
+<!-- MULTI-USER BRIDGE v7 - LOCAL-FIRST + FAST LOGIN + NO-CACHE CROSS-ACCOUNT SYNC -->
 <script>
 (function(){
   'use strict';
@@ -6684,7 +6684,13 @@
     const headers=Object.assign({},opt.headers||{});
     if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';
     const t=getToken(); if(t)headers.Authorization='Bearer '+t;
-    const res=await fetch(API_BASE+path,{...opt,headers});
+    const method=String(opt.method||'GET').toUpperCase();
+    const fetchOpt={...opt,headers};
+    // Dữ liệu dùng chung tuyệt đối không được lấy từ HTTP/browser cache.
+    // Đây là nguyên nhân khiến tài khoản thứ 2 có thể tiếp tục nhìn thấy
+    // snapshot cũ dù tài khoản 1 đã lưu/xóa thành công trên server.
+    if(method==='GET'||method==='HEAD') fetchOpt.cache='no-store';
+    const res=await fetch(API_BASE+path,fetchOpt);
     const txt=await res.text(); let data={};
     try{data=txt?JSON.parse(txt):{};}catch(e){data={raw:txt};}
     if(!res.ok){const er=new Error(data.error||('HTTP '+res.status));er.status=res.status;er.data=data;throw er;}
@@ -6782,7 +6788,7 @@
   async function loadState(){
     const beforeHash={};
     for(const k of Object.keys(getters))beforeHash[k]=h(getters[k]());
-    const r=await api('/api/state'), remote=r.state||{};
+    const r=await api('/api/state?ts='+Date.now()), remote=r.state||{};
     const missing=[];
     for(const k of Object.keys(getters)){
       const changedWhileLoading=h(getters[k]())!==beforeHash[k];
@@ -6816,7 +6822,7 @@
   async function pull(){
     if(pulling||!getToken()||!window.currentUser)return; pulling=true;
     try{
-      const r=await api('/api/state'),remote=r.state||{}; let changed=false;
+      const r=await api('/api/state?ts='+Date.now()),remote=r.state||{}; let changed=false;
       for(const k of Object.keys(getters)){
         if(!Array.isArray(remote[k]))continue;
         // Không lấy snapshot cũ từ server khi key đang có thao tác local
