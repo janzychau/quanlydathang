@@ -57,6 +57,8 @@
         background: #94a3b8;
     }
 </style>
+<link rel="preconnect" href="https://quanlydathang-api.onrender.com" crossorigin>
+<link rel="dns-prefetch" href="//quanlydathang-api.onrender.com">
 </head>
 <body class="bg-[#2c5364] min-h-screen flex items-center justify-center antialiased custom-scrollbar">
 
@@ -6583,13 +6585,29 @@
   }
 })();
 </script>
-<!-- MULTI-USER BRIDGE v3 - FAST LOGIN -->
+<!-- MULTI-USER BRIDGE v5 - FAST LOGIN + FAST SAVE -->
 <script>
 (function(){
   'use strict';
   const API_BASE='https://quanlydathang-api.onrender.com';
   const TOKEN_KEY='qldh_api_token_v1';
-  const POLL_MS=20000, SAVE_CHECK_MS=4000;
+  const POLL_MS=30000, SAVE_CHECK_MS=15000;
+  const SAVE_DEBOUNCE_MS=250;
+  const dirtyKeys=new Set();
+  const saveInFlight=new Map();
+  let saveFlushTimer=null;
+  const WARMUP_MS=10*60*1000;
+  let warmupTimer=null, warmupInFlight=null;
+
+  // Render Free có thể sleep sau 15 phút không có traffic. Gọi health nền
+  // khi trang login mở để đánh thức/giữ ấm API, giúp lần đăng nhập nhanh hơn.
+  function warmupAPI(){
+    if(warmupInFlight)return warmupInFlight;
+    warmupInFlight=fetch(API_BASE+'/api/health',{method:'GET',cache:'no-store',mode:'cors'})
+      .catch(()=>null)
+      .finally(()=>{warmupInFlight=null;});
+    return warmupInFlight;
+  }
   const OWNER='Chủ Sở Hữu', ADMIN='Quản Trị', MEMBER='Thành Viên', VIEWER='Người Xem';
   const WRITE_KEYS={
     sanPham:[OWNER,ADMIN,MEMBER], danhMucTabs:[OWNER,ADMIN],
@@ -6662,12 +6680,46 @@
     el.textContent=message||'';
     el.style.display=visible?'block':'none';
   }
+  function markDirty(k){
+    if(!getToken()||!window.currentUser||!canWrite(k))return;
+    dirtyKeys.add(k);
+    if(saveFlushTimer)return;
+    saveFlushTimer=setTimeout(()=>{saveFlushTimer=null;flushDirty();},SAVE_DEBOUNCE_MS);
+  }
+
   async function saveKey(k,v){
     if(!getToken()||!canWrite(k))return;
-    const a=Array.isArray(v)?v:[], x=h(a); if(lastHash[k]===x)return;
-    try{await api('/api/state/'+encodeURIComponent(k),{method:'PUT',body:JSON.stringify(a)});lastHash[k]=x;}
-    catch(e){if(e.status===401){setToken('');}else console.error('SAVE',k,e);}
+    const a=JSON.parse(JSON.stringify(Array.isArray(v)?v:[]));
+    const x=h(a);
+    // Đánh dấu snapshot đã gửi ngay lập tức để vòng polling không gửi trùng.
+    lastHash[k]=x;
+    if(saveInFlight.has(k)){
+      dirtyKeys.add(k);
+      return;
+    }
+    saveInFlight.set(k, true);
+    try{
+      await api('/api/state/'+encodeURIComponent(k),{method:'PUT',body:JSON.stringify(a)});
+    }catch(e){
+      dirtyKeys.add(k);
+      if(e.status===401){setToken('');}else console.error('SAVE',k,e);
+    }finally{
+      saveInFlight.delete(k);
+      const currentHash=h(getters[k]());
+      if(currentHash!==x){dirtyKeys.add(k);}
+    }
   }
+
+  async function flushDirty(){
+    if(!getToken()||!window.currentUser||!dirtyKeys.size)return;
+    const keys=[...dirtyKeys];
+    dirtyKeys.clear();
+    await Promise.all(keys.map(k=>saveKey(k,getters[k]())));
+    if(dirtyKeys.size && !saveFlushTimer){
+      saveFlushTimer=setTimeout(()=>{saveFlushTimer=null;flushDirty();},SAVE_DEBOUNCE_MS);
+    }
+  }
+
   async function loadState(){
     const r=await api('/api/state'), remote=r.state||{};
     const missing=[];
@@ -6708,7 +6760,7 @@
       if(changed){syncRefs();try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}}
     }catch(e){if(e.status===401)setToken('');else console.error('PULL',e);}finally{pulling=false;}
   }
-  function checkSave(){if(!getToken()||!window.currentUser)return;for(const k of Object.keys(getters)){const x=h(getters[k]());if(lastHash[k]!==x)saveKey(k,getters[k]());}}
+  function checkSave(){flushDirty();}
   function startLoops(){if(saveTimer||pollTimer)return;saveTimer=setInterval(checkSave,SAVE_CHECK_MS);pollTimer=setInterval(pull,POLL_MS);}
   function stopLoops(){if(saveTimer)clearInterval(saveTimer);if(pollTimer)clearInterval(pollTimer);saveTimer=pollTimer=null;}
 
@@ -6723,18 +6775,19 @@
     try{switchView('deXuat');}catch(e){}
     setSyncStatus('Đang đồng bộ dữ liệu...',true);
 
-    // Tải nhân viên + toàn bộ state song song, tránh chờ nối tiếp 2-10 request.
-    const results=await Promise.allSettled([loadEmployees(),loadState()]);
-    const failed=results.filter(r=>r.status==='rejected');
-    if(failed.length){
-      console.error('SYNC AFTER LOGIN',failed);
-      setSyncStatus('Đã vào hệ thống • Đồng bộ đang thử lại...',true);
-      setTimeout(()=>setSyncStatus('',false),5000);
-    } else {
-      setSyncStatus('Đã đồng bộ dữ liệu ✓',true);
-      setTimeout(()=>setSyncStatus('',false),1800);
-    }
+    // Tải dữ liệu nền, tuyệt đối không chặn thao tác của người dùng sau khi login.
     startLoops();
+    Promise.allSettled([loadEmployees(),loadState()]).then(results=>{
+      const failed=results.filter(r=>r.status==='rejected');
+      if(failed.length){
+        console.error('SYNC AFTER LOGIN',failed);
+        setSyncStatus('Đã vào hệ thống • Đồng bộ đang thử lại...',true);
+        setTimeout(()=>setSyncStatus('',false),5000);
+      } else {
+        setSyncStatus('Đã đồng bộ dữ liệu ✓',true);
+        setTimeout(()=>setSyncStatus('',false),1800);
+      }
+    });
     try{if(typeof applyRoleUI==='function')applyRoleUI();}catch(e){}
     try{if(typeof switchView==='function'&&currentView)switchView(currentView);}catch(e){}
   }
@@ -6748,8 +6801,17 @@
     const oldText=btn?.innerText;
     if(btn){btn.disabled=true;btn.innerText='Đang xác thực...';}
     try{
-      // Chỉ chờ API đăng nhập. Không chặn màn hình bởi bước tải dữ liệu phía sau.
-      const r=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username,password})});
+      // Gọi login bằng text/plain để tránh thêm một vòng CORS preflight.
+      // Backend vẫn parse JSON body bình thường.
+      const res=await fetch(API_BASE+'/api/auth/login',{
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=UTF-8'},
+        body:JSON.stringify({username,password}),
+        cache:'no-store'
+      });
+      const txt=await res.text();
+      let r={}; try{r=txt?JSON.parse(txt):{};}catch(_){}
+      if(!res.ok){const er=new Error(r.error||('HTTP '+res.status));er.status=res.status;er.data=r;throw er;}
       setToken(r.token);
       await finishLogin(r.user);
     } catch(err){
@@ -6792,10 +6854,55 @@
     showCustomConfirm(`Bạn có chắc muốn xóa nhân viên "${n?.ten||''}"?`,'Xác Nhận Xóa',async()=>{try{await api('/api/employees/'+encodeURIComponent(id),{method:'DELETE'});await loadEmployees();renderNhanVienView();}catch(err){fail(err.data?.error||'Không thể xóa nhân viên.');}});
   };
 
-  document.addEventListener('DOMContentLoaded',()=>setTimeout(async()=>{
-    const t=getToken();if(!t)return;
-    try{const r=await api('/api/auth/me');await finishLogin(r.user);}catch(e){setToken('');}
-  },150));
+  // Đánh dấu thay đổi ngay khi người dùng Lưu/Xóa, thay cho quét JSON toàn bộ mỗi 4 giây.
+  function snapshotKeys(keys){
+    const m={};
+    keys.forEach(k=>m[k]=h(getters[k]()));
+    return m;
+  }
+  function wrapSaveSync(name, keysFn){
+    const orig=window[name];
+    if(typeof orig!=='function' || orig.__qldhFastSync)return;
+    const wrapped=function(...args){
+      let keys=[];
+      try{keys=keysFn(...args)||[];}catch(e){keys=[];}
+      const before=snapshotKeys(keys);
+      const result=orig.apply(this,args);
+      const after=snapshotKeys(keys);
+      keys.forEach(k=>{if(before[k]!==after[k])markDirty(k);});
+      return result;
+    };
+    wrapped.__qldhFastSync=true;
+    window[name]=wrapped;
+  }
+
+  wrapSaveSync('handleSaveDeXuat',()=>['phieuDeXuat']);
+  wrapSaveSync('handleSaveDuyetDeXuat',()=>['phieuDeXuat','phieuDuyetDeXuat']);
+  wrapSaveSync('handleSaveDatHang',()=>['phieuDatHang','phieuDuyetDeXuat']);
+  wrapSaveSync('handleSavePhieuTienDo',()=>{
+    const t=document.getElementById('editTDType')?.value;
+    return t==='nhanHang'?['phieuNhanHang','phieuDatHang']:
+           t==='traHang'?['phieuTraHang','phieuDatHang']:
+           t==='huyHang'?['phieuHuyHang','phieuDatHang']:[];
+  });
+  wrapSaveSync('handleSaveSanPham',()=>['sanPham']);
+  wrapSaveSync('handleSaveTab',()=>['danhMucTabs']);
+  wrapSaveSync('handleSaveItem',()=>['danhMucTabs']);
+  wrapSaveSync('handleDeleteDeXuat',()=>['phieuDeXuat']);
+  wrapSaveSync('handleDeleteSanPham',()=>['sanPham']);
+  wrapSaveSync('handleDeleteTab',()=>['danhMucTabs']);
+  wrapSaveSync('handleDeleteItem',()=>['danhMucTabs']);
+
+  document.addEventListener('DOMContentLoaded',()=>{
+    warmupAPI();
+    warmupTimer=setInterval(()=>{
+      if(document.getElementById('loginView') && !document.getElementById('loginView').classList.contains('hidden')) warmupAPI();
+    },WARMUP_MS);
+    setTimeout(async()=>{
+      const t=getToken();if(!t)return;
+      try{const r=await api('/api/auth/me');await finishLogin(r.user);}catch(e){setToken('');}
+    },150);
+  });
 })();
 
 </script>
