@@ -6801,11 +6801,11 @@
     const oldText=btn?.innerText;
     if(btn){btn.disabled=true;btn.innerText='Đang xác thực...';}
     try{
-      // Gọi login bằng text/plain để tránh thêm một vòng CORS preflight.
-      // Backend vẫn parse JSON body bình thường.
+      // Backend dùng express.json nên phải gửi đúng Content-Type application/json.
+      // CORS hiện đã cho phép preflight OPTIONS và Authorization/Content-Type.
       const res=await fetch(API_BASE+'/api/auth/login',{
         method:'POST',
-        headers:{'Content-Type':'text/plain;charset=UTF-8'},
+        headers:{'Content-Type':'application/json'},
         body:JSON.stringify({username,password}),
         cache:'no-store'
       });
@@ -6895,6 +6895,9 @@
 
   document.addEventListener('DOMContentLoaded',()=>{
     warmupAPI();
+    window.addEventListener('focus',()=>{
+      if(document.getElementById('loginView') && !document.getElementById('loginView').classList.contains('hidden')) warmupAPI();
+    });
     warmupTimer=setInterval(()=>{
       if(document.getElementById('loginView') && !document.getElementById('loginView').classList.contains('hidden')) warmupAPI();
     },WARMUP_MS);
