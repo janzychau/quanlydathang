@@ -1109,6 +1109,7 @@
                                         <th class="p-2.5 border-r text-center w-10">STT</th>
                                         <th class="p-2.5 border-r w-24">Ngày Lập</th>
                                         <th class="p-2.5 border-r">Người Lập Phiếu</th>
+                                        <th class="p-2.5 border-r min-w-[130px]">Team Đề Xuất</th>
                                         <th class="p-2.5 border-r font-mono">Phiếu Đề Xuất</th>
                                         <th class="p-2.5 border-r text-center w-24">Số Mặt Hàng</th>
                                         <th class="p-2.5 border-r text-center w-24">Tổng SL Đề Xuất</th>
@@ -1156,7 +1157,7 @@
             let slicedData = sliceDataByPageSize(filtered, pageSizeDX);
 
             if (slicedData.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="10" class="p-6 text-center text-slate-400">Không tìm thấy phiếu đề xuất phù hợp</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="11" class="p-6 text-center text-slate-400">Không tìm thấy phiếu đề xuất phù hợp</td></tr>`;
                 return;
             }
 
@@ -1172,6 +1173,7 @@
                         <td class="p-2.5 border-r text-center font-medium">${idx + 1}</td>
                         <td class="p-2.5 border-r text-center text-slate-600">${formatDateVN(p.ngayLap)}</td>
                         <td class="p-2.5 border-r font-bold text-slate-800">${p.nguoiLap}</td>
+                        <td class="p-2.5 border-r font-semibold text-slate-700">${p.teamDeXuat || '-'}</td>
                         <td class="p-2.5 border-r font-mono font-bold text-sky-600">${p.ma}</td>
                         <td class="p-2.5 border-r text-center font-bold text-slate-700">${p.items.length}</td>
                         <td class="p-2.5 border-r text-center font-mono font-bold text-sky-700">${totalSL}</td>
@@ -4326,6 +4328,13 @@
         const table = document.querySelector(`#${tableId}`)?.closest('table');
         if (!table || table.dataset.teamReady === '1') return;
 
+        // Phiếu Đề Xuất đã có cột Team Đề Xuất ngay trong render gốc;
+        // không chèn thêm một cột động nữa để tránh chớp/mất cột sau khi lưu.
+        if (tableId === 'tbDeXuatBody') {
+            table.dataset.teamReady = '1';
+            return;
+        }
+
         const trh = table.querySelector('thead tr');
         if (trh) {
             const th = document.createElement('th');
@@ -6596,7 +6605,7 @@
   const dirtyKeys=new Set();
   const saveInFlight=new Map();
   let saveFlushTimer=null;
-  const WARMUP_MS=10*60*1000;
+  const WARMUP_MS=5*60*1000;
   let warmupTimer=null, warmupInFlight=null;
 
   // Render Free có thể sleep sau 15 phút không có traffic. Gọi health nền
@@ -6608,6 +6617,8 @@
       .finally(()=>{warmupInFlight=null;});
     return warmupInFlight;
   }
+  // Khởi động API ngay khi bridge được nạp để giảm thời gian login lần đầu.
+  setTimeout(warmupAPI,0);
   const OWNER='Chủ Sở Hữu', ADMIN='Quản Trị', MEMBER='Thành Viên', VIEWER='Người Xem';
   const WRITE_KEYS={
     sanPham:[OWNER,ADMIN,MEMBER], danhMucTabs:[OWNER,ADMIN],
@@ -6689,24 +6700,27 @@
 
   async function saveKey(k,v){
     if(!getToken()||!canWrite(k))return;
+    // Không cho pull ghi đè dữ liệu đang trong lúc lưu.
+    if(saveInFlight.has(k)){dirtyKeys.add(k);return;}
     const a=JSON.parse(JSON.stringify(Array.isArray(v)?v:[]));
     const x=h(a);
-    // Đánh dấu snapshot đã gửi ngay lập tức để vòng polling không gửi trùng.
-    lastHash[k]=x;
-    if(saveInFlight.has(k)){
-      dirtyKeys.add(k);
-      return;
-    }
-    saveInFlight.set(k, true);
+    saveInFlight.set(k,{hash:x});
     try{
       await api('/api/state/'+encodeURIComponent(k),{method:'PUT',body:JSON.stringify(a)});
+      // Chỉ xác nhận snapshot sau khi server đã trả thành công.
+      lastHash[k]=x;
     }catch(e){
       dirtyKeys.add(k);
       if(e.status===401){setToken('');}else console.error('SAVE',k,e);
     }finally{
       saveInFlight.delete(k);
       const currentHash=h(getters[k]());
-      if(currentHash!==x){dirtyKeys.add(k);}
+      if(currentHash!==x){
+        dirtyKeys.add(k);
+        if(!saveFlushTimer){saveFlushTimer=setTimeout(()=>{saveFlushTimer=null;flushDirty();},SAVE_DEBOUNCE_MS);}
+      } else {
+        dirtyKeys.delete(k);
+      }
     }
   }
 
@@ -6752,8 +6766,10 @@
       const r=await api('/api/state'),remote=r.state||{}; let changed=false;
       for(const k of Object.keys(getters)){
         if(!Array.isArray(remote[k]))continue;
+        // Không lấy snapshot cũ từ server trong lúc key này đang chờ lưu.
+        if(dirtyKeys.has(k)||saveInFlight.has(k))continue;
         const rh=h(remote[k]), lh=h(getters[k]());
-        // If local has changed since the last server snapshot, let the saver win.
+        // Nếu local khác snapshot đã xác nhận thì local đang có thay đổi chưa sync.
         if(lastHash[k]!==undefined&&lh!==lastHash[k])continue;
         if(lh!==rh){setKey(k,remote[k]);lastHash[k]=rh;changed=true;}
       }
@@ -6799,13 +6815,13 @@
     const btn=document.querySelector('#loginView button[type="submit"]');
     if(!username||!password)return fail('Vui lòng nhập Tài khoản và Mật khẩu.');
     const oldText=btn?.innerText;
-    if(btn){btn.disabled=true;btn.innerText='Đang xác thực...';}
+    if(btn){btn.disabled=true;btn.innerText='Đang xác thực máy chủ...';}
 
     let r;
     try{
       const res=await fetch(API_BASE+'/api/auth/login',{
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers:{'Content-Type':'text/plain;charset=UTF-8'},
         body:JSON.stringify({username,password}),
         cache:'no-store'
       });
